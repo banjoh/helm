@@ -16,5 +16,3 @@ pkg/cmd/testdata/testcharts/issue-7233/charts/*
 .pre-commit-config.yaml
 
 CLAUDE.md
-# Ignore all files in the tasks directory
-tasks/*
