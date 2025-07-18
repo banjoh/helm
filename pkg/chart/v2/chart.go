@@ -51,9 +51,17 @@ type Chart struct {
 	// Files are miscellaneous files in a chart archive,
 	// e.g. README, LICENSE, etc.
 	Files []*File `json:"files"`
+	// Subcharts are the subcharts in the chart.
+	// Needed for building depedency graph for the chart.
+	SubCharts []*SubChart `json:"subcharts,omitempty"`
 
 	parent       *Chart
 	dependencies []*Chart
+}
+
+type SubChart struct {
+	Metadata *Metadata `json:"metadata"`
+	SubCharts []*SubChart `json:"subcharts,omitempty"`
 }
 
 type CRD struct {

@@ -47,6 +47,8 @@ type Dependency struct {
 	ImportValues []interface{} `json:"import-values,omitempty" yaml:"import-values,omitempty"`
 	// Alias usable alias to be used for the chart
 	Alias string `json:"alias,omitempty" yaml:"alias,omitempty"`
+	// DependsOn is the list of subcharts that this chart depends on.
+	DependsOn []string `json:"dependsOn,omitempty" yaml:"dependsOn,omitempty"`
 }
 
 // Validate checks for common problems with the dependency datastructure in
