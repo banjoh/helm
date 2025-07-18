@@ -201,7 +201,7 @@ func (dag *SubchartDAG) GetInstallationBatches() [][]Subchart {
 ### Architecture Changes
 
 1. **Chart Metadata Extension** (`pkg/chart/v2/`)
-   - Add `DependsOn []string` field to `Dependency` struct
+   - ✅ Add `DependsOn []string` field to `Dependency` struct
    - Add annotation parsing for `helm.sh/depends-on/subcharts`
 
 2. **Dependency Processing** (`pkg/chart/v2/util/dependencies.go`)
@@ -220,11 +220,16 @@ func (dag *SubchartDAG) GetInstallationBatches() [][]Subchart {
    - Add timeout mechanisms using existing timeout handling
 
 5. **Release Storage** (`pkg/release/v1/`)
-   - Concatenate manifests in topological dependency order
-   - Store manifests in release.Manifest field in installation sequence
-   - Maintain backward compatibility with existing release structure
+   - Store DAG reconstruction metadata in release object
+   - Implement manifest-based DAG reconstruction for rollbacks
+   - Handle post-renderer scenarios with robust subchart identification
 
-6. **Hook System** (`pkg/release/v1/hook.go`)
+6. **Manifest Processing** (`pkg/release/util/`)
+   - Add subchart identification from Source comments
+   - Handle nested subchart path parsing correctly
+   - Support post-renderer edge cases with fallback strategies
+
+7. **Hook System** (`pkg/release/v1/hook.go`)
    - No changes required - use existing hook system
 
 ### Key Data Structures
@@ -235,8 +240,35 @@ type Dependency struct {
     Name         string   `json:"name"`
     Version      string   `json:"version,omitempty"`
     Repository   string   `json:"repository,omitempty"`
-    DependsOn    []string `json:"depends-on,omitempty"`  // NEW
+    DependsOn    []string `json:"dependsOn,omitempty"`  // ✅ IMPLEMENTED
     // ... existing fields
+}
+
+// Enhanced Release struct for DAG reconstruction
+type Release struct {
+    // ... existing fields
+    Manifest        string                 `json:"manifest,omitempty"`
+    SequencingInfo  *SequencingMetadata    `json:"sequencing,omitempty"`  // NEW
+}
+
+// DAG reconstruction metadata
+type SequencingMetadata struct {
+    Enabled         bool                   `json:"enabled"`
+    Strategy        string                 `json:"strategy"`        // "ordered"
+    Batches         []BatchInfo            `json:"batches"`
+    Dependencies    map[string][]string    `json:"dependencies"`    // subchart -> dependsOn
+}
+
+type BatchInfo struct {
+    Order          int                     `json:"order"`
+    Subcharts      []string                `json:"subcharts"`
+}
+
+// Subchart path parsing for manifest analysis
+type SubchartPath struct {
+    Hierarchy []string  // ["redis", "sentinel"] for nested subcharts
+    Immediate string    // "sentinel" - the actual subchart
+    Parent    string    // "redis" - parent subchart (if nested)
 }
 
 // New wait strategy
@@ -293,24 +325,27 @@ type SubchartState struct {
 26. Add CLI integration tests
 
 ### Phase 7: Release Storage Enhancement
-27. Modify manifest concatenation to use topological dependency order
-28. Update `pkg/engine/engine.go` to render templates in dependency order
-29. Ensure `release.Manifest` field contains manifests in installation sequence
-30. Add unit tests for manifest ordering in release storage
+27. Add `SequencingMetadata` field to `Release` struct in `pkg/release/v1/release.go`
+28. Implement manifest-based DAG reconstruction in `pkg/release/util/`
+29. Add robust subchart identification from Source comments with nested support
+30. Handle post-renderer edge cases with fallback strategies
+31. Ensure rollback operations can reconstruct DAG from stored manifest
+32. Add unit tests for manifest-based DAG reconstruction
 
 ### Phase 8: Testing and Documentation
-31. Add comprehensive unit tests for all new functionality
-32. Add integration tests for end-to-end subchart sequencing
-33. Add performance tests to ensure < 5% overhead
-34. Update user documentation with examples
-35. Add troubleshooting guide for common sequencing issues
+33. Add comprehensive unit tests for all new functionality
+34. Add integration tests for end-to-end subchart sequencing
+35. Add performance tests to ensure < 5% overhead
+36. Test manifest-based DAG reconstruction with various post-renderer scenarios
+37. Update user documentation with examples
+38. Add troubleshooting guide for common sequencing issues
 
 ### Phase 9: Validation and Polish
-36. Validate backward compatibility with existing charts
-37. Performance optimization and memory usage analysis
-38. Add debugging commands for dependency visualization
-39. Final code review and cleanup
-40. Prepare release notes and migration guide
+39. Validate backward compatibility with existing charts
+40. Performance optimization and memory usage analysis
+41. Add debugging commands for dependency visualization
+42. Final code review and cleanup
+43. Prepare release notes and migration guide
 
 ## Success Criteria
 
@@ -320,6 +355,9 @@ type SubchartState struct {
 - ✅ Support for both annotation-based and field-based dependency declaration
 - ✅ Comprehensive error handling with clear user messages
 - ✅ Full backward compatibility with Helm v3 charts
+- ✅ Robust DAG reconstruction from manifests for rollback scenarios
+- ✅ Post-renderer compatibility with fallback strategies
+- ✅ Correct handling of nested subchart dependencies
 
 ## Risk Mitigation
 
@@ -328,7 +366,24 @@ type SubchartState struct {
 - **Backward Compatibility**: Extensive testing with existing charts
 - **Complex Error Scenarios**: Comprehensive error handling and rollback logic
 - **Memory Usage**: Monitor and optimize memory consumption during processing
+- **Post-Renderer Compatibility**: Multiple fallback strategies for subchart identification
+- **Nested Subchart Complexity**: Proper path parsing to handle arbitrary nesting levels
+- **Manifest Corruption**: Robust error handling when Source comments are missing
 
 ## Review
 
 This implementation plan provides a comprehensive roadmap for adding subchart sequencing support to Helm v4. The plan is structured in phases to enable incremental development and testing, with clear success criteria and risk mitigation strategies.
+
+### Key Updates Based on Analysis:
+
+1. **Manifest-Based DAG Reconstruction**: The plan now includes robust DAG reconstruction from stored manifests, enabling rollback scenarios to maintain subchart sequencing even after post-renderer modifications.
+
+2. **Post-Renderer Compatibility**: Added comprehensive strategies for handling post-renderer scenarios, including fallback mechanisms when Source comments are modified or removed.
+
+3. **Nested Subchart Support**: Enhanced subchart path parsing to correctly identify nested subcharts (e.g., "sentinel" within "redis") rather than just the top-level parent.
+
+4. **Enhanced Release Storage**: Modified the release storage approach to include minimal sequencing metadata while leveraging manifest analysis for DAG reconstruction.
+
+5. **Robust Error Handling**: Added comprehensive error handling for edge cases including missing Source comments, disabled subcharts, and post-renderer modifications.
+
+The implementation maintains backward compatibility while providing robust subchart sequencing capabilities that work reliably across various deployment scenarios.
