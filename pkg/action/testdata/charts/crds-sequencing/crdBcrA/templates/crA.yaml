@@ -1,0 +1,6 @@
+apiVersion: "stable.example.com/v1"
+kind: A
+metadata:
+  name: a
+spec:
+  color: red
