@@ -1,0 +1,30 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: bs.stable.example.com
+spec:
+  group: stable.example.com
+  scope: Namespaced
+  names:
+    plural: bs
+    singular: b
+    kind: B
+  versions:
+  - name: v1
+    served: true
+    storage: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              color:
+                type: string
+    selectableFields:
+    - jsonPath: .spec.color
+    additionalPrinterColumns:
+    - jsonPath: .spec.color
+      name: Color
+      type: string
