@@ -202,6 +202,13 @@ func LoadFiles(files []*BufferedFile) (*chart.Chart, error) {
 			return c, fmt.Errorf("error unpacking subchart %s in %s: %w", n, c.Name(), err)
 		}
 		c.AddDependency(sc)
+
+		// Marshal subchart Chart.yaml into SubCharts field
+		subChart := &chart.SubChart{
+			Metadata: sc.Metadata,
+			SubCharts: sc.SubCharts,
+		}
+		c.SubCharts = append(c.SubCharts, subChart)
 	}
 
 	return c, nil
