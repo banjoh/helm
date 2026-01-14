@@ -159,12 +159,12 @@ func (mem *Memory) Query(keyvals map[string]string) ([]release.Releaser, error) 
 func (mem *Memory) Create(key string, rel release.Releaser) error {
 	defer unlock(mem.wlock())
 
-	rls, err := releaserToV1Release(rel)
+	ac, err := release.NewAccessor(rel)
 	if err != nil {
 		return err
 	}
 	// For backwards compatibility, we protect against an unset namespace
-	namespace := rls.Namespace
+	namespace := ac.Namespace()
 	if namespace == "" {
 		namespace = defaultNamespace
 	}
@@ -174,14 +174,14 @@ func (mem *Memory) Create(key string, rel release.Releaser) error {
 		mem.cache[namespace] = memReleases{}
 	}
 
-	if recs, ok := mem.cache[namespace][rls.Name]; ok {
-		if err := recs.Add(newRecord(key, rls)); err != nil {
+	if recs, ok := mem.cache[namespace][ac.Name()]; ok {
+		if err := recs.Add(newRecord(key, rel)); err != nil {
 			return err
 		}
-		mem.cache[namespace][rls.Name] = recs
+		mem.cache[namespace][ac.Name()] = recs
 		return nil
 	}
-	mem.cache[namespace][rls.Name] = records{newRecord(key, rls)}
+	mem.cache[namespace][ac.Name()] = records{newRecord(key, rel)}
 	return nil
 }
 
@@ -189,21 +189,21 @@ func (mem *Memory) Create(key string, rel release.Releaser) error {
 func (mem *Memory) Update(key string, rel release.Releaser) error {
 	defer unlock(mem.wlock())
 
-	rls, err := releaserToV1Release(rel)
+	ac, err := release.NewAccessor(rel)
 	if err != nil {
 		return err
 	}
 
 	// For backwards compatibility, we protect against an unset namespace
-	namespace := rls.Namespace
+	namespace := ac.Namespace()
 	if namespace == "" {
 		namespace = defaultNamespace
 	}
 	mem.SetNamespace(namespace)
 
 	if _, ok := mem.cache[namespace]; ok {
-		if rs, ok := mem.cache[namespace][rls.Name]; ok && rs.Exists(key) {
-			rs.Replace(key, newRecord(key, rls))
+		if rs, ok := mem.cache[namespace][ac.Name()]; ok && rs.Exists(key) {
+			rs.Replace(key, newRecord(key, rel))
 			return nil
 		}
 	}

@@ -124,6 +124,66 @@ func (a *v1HookAccessor) Manifest() string {
 	return a.hook.Manifest
 }
 
+func (a *v1HookAccessor) Name() string {
+	return a.hook.Name
+}
+
+func (a *v1HookAccessor) Kind() string {
+	return a.hook.Kind
+}
+
+func (a *v1HookAccessor) Weight() int {
+	return a.hook.Weight
+}
+
+func (a *v1HookAccessor) HasEvent(event string) bool {
+	for _, e := range a.hook.Events {
+		if string(e) == event {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *v1HookAccessor) HasDeletePolicy(policy string) bool {
+	for _, p := range a.hook.DeletePolicies {
+		if string(p) == policy {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *v1HookAccessor) SetDefaultDeletePolicy() {
+	if len(a.hook.DeletePolicies) == 0 {
+		a.hook.DeletePolicies = []v1release.HookDeletePolicy{v1release.HookBeforeHookCreation}
+	}
+}
+
+func (a *v1HookAccessor) HasOutputLogPolicy(policy string) bool {
+	for _, p := range a.hook.OutputLogPolicies {
+		if string(p) == policy {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *v1HookAccessor) SetLastRunStarted() {
+	a.hook.LastRun = v1release.HookExecution{
+		StartedAt: time.Now(),
+		Phase:     v1release.HookPhaseRunning,
+	}
+}
+
+func (a *v1HookAccessor) SetLastRunPhase(phase string) {
+	a.hook.LastRun.Phase = v1release.HookPhase(phase)
+}
+
+func (a *v1HookAccessor) SetLastRunCompleted() {
+	a.hook.LastRun.CompletedAt = time.Now()
+}
+
 type v2Accessor struct {
 	rel *v2release.Release
 }
@@ -186,4 +246,64 @@ func (a *v2HookAccessor) Path() string {
 
 func (a *v2HookAccessor) Manifest() string {
 	return a.hook.Manifest
+}
+
+func (a *v2HookAccessor) Name() string {
+	return a.hook.Name
+}
+
+func (a *v2HookAccessor) Kind() string {
+	return a.hook.Kind
+}
+
+func (a *v2HookAccessor) Weight() int {
+	return a.hook.Weight
+}
+
+func (a *v2HookAccessor) HasEvent(event string) bool {
+	for _, e := range a.hook.Events {
+		if string(e) == event {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *v2HookAccessor) HasDeletePolicy(policy string) bool {
+	for _, p := range a.hook.DeletePolicies {
+		if string(p) == policy {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *v2HookAccessor) SetDefaultDeletePolicy() {
+	if len(a.hook.DeletePolicies) == 0 {
+		a.hook.DeletePolicies = []v2release.HookDeletePolicy{v2release.HookBeforeHookCreation}
+	}
+}
+
+func (a *v2HookAccessor) HasOutputLogPolicy(policy string) bool {
+	for _, p := range a.hook.OutputLogPolicies {
+		if string(p) == policy {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *v2HookAccessor) SetLastRunStarted() {
+	a.hook.LastRun = v2release.HookExecution{
+		StartedAt: time.Now(),
+		Phase:     v2release.HookPhaseRunning,
+	}
+}
+
+func (a *v2HookAccessor) SetLastRunPhase(phase string) {
+	a.hook.LastRun.Phase = v2release.HookPhase(phase)
+}
+
+func (a *v2HookAccessor) SetLastRunCompleted() {
+	a.hook.LastRun.CompletedAt = time.Now()
 }

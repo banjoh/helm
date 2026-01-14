@@ -29,6 +29,7 @@ import (
 	"time"
 
 	c3 "helm.sh/helm/v4/internal/chart/v3"
+	"helm.sh/helm/v4/internal/gates"
 	"helm.sh/helm/v4/pkg/chart"
 	c2 "helm.sh/helm/v4/pkg/chart/v2"
 )
@@ -86,6 +87,7 @@ func TestLoadArchive(t *testing.T) {
 		expectedChart   chart.Charter
 		expectedError   string
 		createChartYaml bool
+		enableV3Gate    bool
 	}{
 		{
 			name:       "valid v2 chart archive",
@@ -106,6 +108,16 @@ func TestLoadArchive(t *testing.T) {
 				Metadata: &c3.Metadata{APIVersion: c3.APIVersionV3, Name: "mychart-v3", Version: "0.1.0", Description: "A test chart"},
 			},
 			createChartYaml: true,
+			enableV3Gate:    true,
+		},
+		{
+			name:            "v3 chart without feature flag",
+			chartName:       "mychart-v3-noflag",
+			apiVersion:      c3.APIVersionV3,
+			extraFiles:      map[string][]byte{"templates/config.yaml": []byte("key: value")},
+			expectedError:   "this feature has been marked as experimental",
+			createChartYaml: true,
+			enableV3Gate:    false,
 		},
 		{
 			name:          "invalid gzip header",
@@ -139,6 +151,11 @@ func TestLoadArchive(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			// Handle v3 feature gate
+			if tc.enableV3Gate {
+				t.Setenv(string(gates.ChartV3), "1")
+			}
+
 			var reader io.Reader
 			if tc.inputReader != nil {
 				reader = tc.inputReader

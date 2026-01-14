@@ -28,6 +28,8 @@ import (
 	"golang.org/x/term"
 	"sigs.k8s.io/yaml"
 
+	v3chart "helm.sh/helm/v4/internal/chart/v3"
+	v3chartutil "helm.sh/helm/v4/internal/chart/v3/util"
 	ci "helm.sh/helm/v4/pkg/chart"
 	"helm.sh/helm/v4/pkg/chart/loader"
 	chart "helm.sh/helm/v4/pkg/chart/v2"
@@ -75,14 +77,28 @@ func (p *Package) Run(path string, _ map[string]interface{}) (string, error) {
 	if err != nil {
 		return "", err
 	}
+
 	var ch *chart.Chart
+	var chV3 *v3chart.Chart
+	var isV3 bool
 	switch c := chrt.(type) {
 	case *chart.Chart:
 		ch = c
 	case chart.Chart:
 		ch = &c
+	case *v3chart.Chart:
+		chV3 = c
+		isV3 = true
+	case v3chart.Chart:
+		chV3 = &c
+		isV3 = true
 	default:
 		return "", errors.New("invalid chart apiVersion")
+	}
+
+	// Handle v3 charts
+	if isV3 {
+		return p.runV3(chV3)
 	}
 
 	ac, err := ci.NewAccessor(ch)
@@ -166,18 +182,20 @@ func (p *Package) Clearsign(filename string) error {
 	if err != nil {
 		return fmt.Errorf("failed to load chart for signing: %w", err)
 	}
-	var ch *chart.Chart
+
+	var metadataBytes []byte
 	switch c := chrt.(type) {
 	case *chart.Chart:
-		ch = c
+		metadataBytes, err = yaml.Marshal(c.Metadata)
 	case chart.Chart:
-		ch = &c
+		metadataBytes, err = yaml.Marshal(c.Metadata)
+	case *v3chart.Chart:
+		metadataBytes, err = yaml.Marshal(c.Metadata)
+	case v3chart.Chart:
+		metadataBytes, err = yaml.Marshal(c.Metadata)
 	default:
 		return errors.New("invalid chart apiVersion")
 	}
-
-	// Marshal chart metadata to YAML bytes
-	metadataBytes, err := yaml.Marshal(ch.Metadata)
 	if err != nil {
 		return fmt.Errorf("failed to marshal chart metadata: %w", err)
 	}
@@ -195,6 +213,56 @@ func (p *Package) Clearsign(filename string) error {
 	}
 
 	return os.WriteFile(filename+".prov", []byte(sig), 0644)
+}
+
+// runV3 executes 'helm package' against a v3 chart and returns the path to the packaged chart.
+func (p *Package) runV3(ch *v3chart.Chart) (string, error) {
+	ac, err := ci.NewAccessor(ch)
+	if err != nil {
+		return "", err
+	}
+
+	// If version is set, modify the version.
+	if p.Version != "" {
+		ch.Metadata.Version = p.Version
+	}
+
+	if err := validateVersion(ch.Metadata.Version); err != nil {
+		return "", err
+	}
+
+	if p.AppVersion != "" {
+		ch.Metadata.AppVersion = p.AppVersion
+	}
+
+	if reqs := ac.MetaDependencies(); len(reqs) > 0 {
+		if err := CheckDependencies(ch, reqs); err != nil {
+			return "", err
+		}
+	}
+
+	var dest string
+	if p.Destination == "." {
+		// Save to the current working directory.
+		dest, err = os.Getwd()
+		if err != nil {
+			return "", err
+		}
+	} else {
+		// Otherwise save to set destination
+		dest = p.Destination
+	}
+
+	name, err := v3chartutil.Save(ch, dest)
+	if err != nil {
+		return "", fmt.Errorf("failed to save: %w", err)
+	}
+
+	if p.Sign {
+		err = p.Clearsign(name)
+	}
+
+	return name, err
 }
 
 // promptUser implements provenance.PassphraseFetcher

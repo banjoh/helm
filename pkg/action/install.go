@@ -41,6 +41,9 @@ import (
 	"k8s.io/cli-runtime/pkg/resource"
 	"sigs.k8s.io/yaml"
 
+	v3chart "helm.sh/helm/v4/internal/chart/v3"
+	v3chartutil "helm.sh/helm/v4/internal/chart/v3/util"
+	v2release "helm.sh/helm/v4/internal/release/v2"
 	ci "helm.sh/helm/v4/pkg/chart"
 	"helm.sh/helm/v4/pkg/chart/common"
 	"helm.sh/helm/v4/pkg/chart/common/util"
@@ -241,6 +244,69 @@ func (i *Install) installCRDs(crds []chart.CRD) error {
 	return nil
 }
 
+// installCRDsV3 installs CRDs from a v3 chart.
+func (i *Install) installCRDsV3(crds []v3chart.CRD) error {
+	// We do these one file at a time in the order they were read.
+	totalItems := []*resource.Info{}
+	for _, obj := range crds {
+		// Read in the resources
+		res, err := i.cfg.KubeClient.Build(bytes.NewBuffer(obj.File.Data), false)
+		if err != nil {
+			return fmt.Errorf("failed to install CRD %s: %w", obj.Name, err)
+		}
+
+		// Send them to Kube
+		if _, err := i.cfg.KubeClient.Create(
+			res,
+			kube.ClientCreateOptionServerSideApply(i.ServerSideApply, i.ForceConflicts)); err != nil {
+			// If the error is CRD already exists, continue.
+			if apierrors.IsAlreadyExists(err) {
+				crdName := obj.Name
+				i.cfg.Logger().Debug("CRD is already present. Skipping", "crd", crdName)
+				continue
+			}
+			return fmt.Errorf("failed to install CRD %s: %w", obj.Name, err)
+		}
+		totalItems = append(totalItems, res...)
+	}
+	if len(totalItems) > 0 {
+		waiter, err := i.cfg.KubeClient.GetWaiter(i.WaitStrategy)
+		if err != nil {
+			return fmt.Errorf("unable to get waiter: %w", err)
+		}
+		// Give time for the CRD to be recognized.
+		if err := waiter.Wait(totalItems, 60*time.Second); err != nil {
+			return err
+		}
+
+		// If we have already gathered the capabilities, we need to invalidate
+		// the cache so that the new CRDs are recognized.
+		if i.cfg.Capabilities != nil {
+			discoveryClient, err := i.cfg.RESTClientGetter.ToDiscoveryClient()
+			if err != nil {
+				return err
+			}
+
+			i.cfg.Logger().Debug("clearing discovery cache")
+			discoveryClient.Invalidate()
+
+			_, _ = discoveryClient.ServerGroups()
+		}
+
+		// Invalidate the REST mapper, since it will not have the new CRDs
+		// present.
+		restMapper, err := i.cfg.RESTClientGetter.ToRESTMapper()
+		if err != nil {
+			return err
+		}
+		if resettable, ok := restMapper.(meta.ResettableRESTMapper); ok {
+			i.cfg.Logger().Debug("clearing REST mapper cache")
+			resettable.Reset()
+		}
+	}
+	return nil
+}
+
 // Run executes the installation
 //
 // If DryRun is set to true, this will prepare the release, but not install it
@@ -255,12 +321,22 @@ func (i *Install) Run(chrt ci.Charter, vals map[string]interface{}) (ri.Releaser
 // When the task is cancelled through ctx, the function returns and the install
 // proceeds in the background.
 func (i *Install) RunWithContext(ctx context.Context, ch ci.Charter, vals map[string]interface{}) (ri.Releaser, error) {
+	// Track both the Charter interface and concrete chart type
 	var chrt *chart.Chart
+	var chrtV3 *v3chart.Chart
+	var isV3 bool
+
 	switch c := ch.(type) {
 	case *chart.Chart:
 		chrt = c
 	case chart.Chart:
 		chrt = &c
+	case *v3chart.Chart:
+		chrtV3 = c
+		isV3 = true
+	case v3chart.Chart:
+		chrtV3 = &c
+		isV3 = true
 	default:
 		return nil, errors.New("invalid chart apiVersion")
 	}
@@ -283,19 +359,38 @@ func (i *Install) RunWithContext(ctx context.Context, ch ci.Charter, vals map[st
 		return nil, fmt.Errorf("release name check failed: %w", err)
 	}
 
-	if err := chartutil.ProcessDependencies(chrt, vals); err != nil {
-		i.cfg.Logger().Error("chart dependencies processing failed", slog.Any("error", err))
-		return nil, fmt.Errorf("chart dependencies processing failed: %w", err)
+	// Process dependencies based on chart version
+	if isV3 {
+		if err := v3chartutil.ProcessDependencies(chrtV3, vals); err != nil {
+			i.cfg.Logger().Error("chart dependencies processing failed", slog.Any("error", err))
+			return nil, fmt.Errorf("chart dependencies processing failed: %w", err)
+		}
+	} else {
+		if err := chartutil.ProcessDependencies(chrt, vals); err != nil {
+			i.cfg.Logger().Error("chart dependencies processing failed", slog.Any("error", err))
+			return nil, fmt.Errorf("chart dependencies processing failed: %w", err)
+		}
 	}
 
 	// Pre-install anything in the crd/ directory. We do this before Helm
 	// contacts the upstream server and builds the capabilities object.
-	if crds := chrt.CRDObjects(); interactWithServer(i.DryRunStrategy) && !i.SkipCRDs && len(crds) > 0 {
-		// On dry run, bail here
-		if isDryRun(i.DryRunStrategy) {
-			i.cfg.Logger().Warn("This chart or one of its subcharts contains CRDs. Rendering may fail or contain inaccuracies.")
-		} else if err := i.installCRDs(crds); err != nil {
-			return nil, err
+	if isV3 {
+		if crds := chrtV3.CRDObjects(); interactWithServer(i.DryRunStrategy) && !i.SkipCRDs && len(crds) > 0 {
+			// On dry run, bail here
+			if isDryRun(i.DryRunStrategy) {
+				i.cfg.Logger().Warn("This chart or one of its subcharts contains CRDs. Rendering may fail or contain inaccuracies.")
+			} else if err := i.installCRDsV3(crds); err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		if crds := chrt.CRDObjects(); interactWithServer(i.DryRunStrategy) && !i.SkipCRDs && len(crds) > 0 {
+			// On dry run, bail here
+			if isDryRun(i.DryRunStrategy) {
+				i.cfg.Logger().Warn("This chart or one of its subcharts contains CRDs. Rendering may fail or contain inaccuracies.")
+			} else if err := i.installCRDs(crds); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -336,7 +431,7 @@ func (i *Install) RunWithContext(ctx context.Context, ch ci.Charter, vals map[st
 		IsInstall: !isUpgrade,
 		IsUpgrade: isUpgrade,
 	}
-	valuesToRender, err := util.ToRenderValuesWithSchemaValidation(chrt, vals, options, caps, i.SkipSchemaValidation)
+	valuesToRender, err := util.ToRenderValuesWithSchemaValidation(ch, vals, options, caps, i.SkipSchemaValidation)
 	if err != nil {
 		return nil, err
 	}
@@ -345,32 +440,69 @@ func (i *Install) RunWithContext(ctx context.Context, ch ci.Charter, vals map[st
 		return nil, fmt.Errorf("user supplied labels contains system reserved label name. System labels: %+v", driver.GetSystemLabels())
 	}
 
-	rel := i.createRelease(chrt, vals, i.Labels)
+	// Create release based on chart version
+	var rel *release.Release
+	var relV2 *v2release.Release
+	if isV3 {
+		relV2 = i.createReleaseV3(chrtV3, vals, i.Labels)
+	} else {
+		rel = i.createRelease(chrt, vals, i.Labels)
+	}
 
 	var manifestDoc *bytes.Buffer
-	rel.Hooks, manifestDoc, rel.Info.Notes, err = i.cfg.renderResources(chrt, valuesToRender, i.ReleaseName, i.OutputDir, i.SubNotes, i.UseReleaseName, i.IncludeCRDs, i.PostRenderer, interactWithServer(i.DryRunStrategy), i.EnableDNS, i.HideSecret)
+	var hooks []*release.Hook
+	var notes string
+	if isV3 {
+		var hooksV2 []*v2release.Hook
+		hooksV2, manifestDoc, notes, err = i.cfg.renderResourcesV3(chrtV3, valuesToRender, i.ReleaseName, i.OutputDir, i.SubNotes, i.UseReleaseName, i.IncludeCRDs, i.PostRenderer, interactWithServer(i.DryRunStrategy), i.EnableDNS, i.HideSecret)
+		relV2.Hooks = hooksV2
+		relV2.Info.Notes = notes
+	} else {
+		hooks, manifestDoc, notes, err = i.cfg.renderResources(chrt, valuesToRender, i.ReleaseName, i.OutputDir, i.SubNotes, i.UseReleaseName, i.IncludeCRDs, i.PostRenderer, interactWithServer(i.DryRunStrategy), i.EnableDNS, i.HideSecret)
+		rel.Hooks = hooks
+		rel.Info.Notes = notes
+	}
 	// Even for errors, attach this if available
+	var manifest string
 	if manifestDoc != nil {
-		rel.Manifest = manifestDoc.String()
+		manifest = manifestDoc.String()
+		if isV3 {
+			relV2.Manifest = manifest
+		} else {
+			rel.Manifest = manifest
+		}
 	}
 	// Check error from render
 	if err != nil {
+		if isV3 {
+			relV2.SetStatus(rcommon.StatusFailed, fmt.Sprintf("failed to render resource: %s", err.Error()))
+			return relV2, err
+		}
 		rel.SetStatus(rcommon.StatusFailed, fmt.Sprintf("failed to render resource: %s", err.Error()))
-		// Return a release with partial data so that the client can show debugging information.
 		return rel, err
 	}
 
 	// Mark this release as in-progress
-	rel.SetStatus(rcommon.StatusPendingInstall, "Initial install underway")
+	if isV3 {
+		relV2.SetStatus(rcommon.StatusPendingInstall, "Initial install underway")
+	} else {
+		rel.SetStatus(rcommon.StatusPendingInstall, "Initial install underway")
+	}
 
 	var toBeAdopted kube.ResourceList
-	resources, err := i.cfg.KubeClient.Build(bytes.NewBufferString(rel.Manifest), !i.DisableOpenAPIValidation)
+	resources, err := i.cfg.KubeClient.Build(bytes.NewBufferString(manifest), !i.DisableOpenAPIValidation)
 	if err != nil {
 		return nil, fmt.Errorf("unable to build kubernetes objects from release manifest: %w", err)
 	}
 
 	// It is safe to use "forceOwnership" here because these are resources currently rendered by the chart.
-	err = resources.Visit(setMetadataVisitor(rel.Name, rel.Namespace, true))
+	var relName, relNamespace string
+	if isV3 {
+		relName, relNamespace = relV2.Name, relV2.Namespace
+	} else {
+		relName, relNamespace = rel.Name, rel.Namespace
+	}
+	err = resources.Visit(setMetadataVisitor(relName, relNamespace, true))
 	if err != nil {
 		return nil, err
 	}
@@ -385,7 +517,7 @@ func (i *Install) RunWithContext(ctx context.Context, ch ci.Charter, vals map[st
 		if i.TakeOwnership {
 			toBeAdopted, err = requireAdoption(resources)
 		} else {
-			toBeAdopted, err = existingResourceConflict(resources, rel.Name, rel.Namespace)
+			toBeAdopted, err = existingResourceConflict(resources, relName, relNamespace)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("unable to continue with install: %w", err)
@@ -394,6 +526,10 @@ func (i *Install) RunWithContext(ctx context.Context, ch ci.Charter, vals map[st
 
 	// Bail out here if it is a dry run
 	if isDryRun(i.DryRunStrategy) {
+		if isV3 {
+			relV2.Info.Description = "Dry run complete"
+			return relV2, nil
+		}
 		rel.Info.Description = "Dry run complete"
 		return rel, nil
 	}
@@ -429,12 +565,29 @@ func (i *Install) RunWithContext(ctx context.Context, ch ci.Charter, vals map[st
 
 	// If Replace is true, we need to supersede the last release.
 	if i.Replace {
-		if err := i.replaceRelease(rel); err != nil {
-			return nil, err
+		if isV3 {
+			if err := i.replaceReleaseV3(relV2); err != nil {
+				return nil, err
+			}
+		} else {
+			if err := i.replaceRelease(rel); err != nil {
+				return nil, err
+			}
 		}
 	}
 
 	// Store the release in history before continuing. We always know that this is a create operation
+	if isV3 {
+		if err := i.cfg.Releases.Create(relV2); err != nil {
+			return relV2, err
+		}
+		relV2, err = i.performInstallCtxV3(ctx, relV2, toBeAdopted, resources)
+		if err != nil {
+			relV2, err = i.failReleaseV3(relV2, err)
+		}
+		return relV2, err
+	}
+
 	if err := i.cfg.Releases.Create(rel); err != nil {
 		// We could try to recover gracefully here, but since nothing has been installed
 		// yet, this is probably safer than trying to continue when we know storage is
@@ -564,6 +717,135 @@ func (i *Install) failRelease(rel *release.Release, err error) (*release.Release
 	return rel, err
 }
 
+// V3 versions of install helper functions
+
+func (i *Install) performInstallCtxV3(ctx context.Context, rel *v2release.Release, toBeAdopted kube.ResourceList, resources kube.ResourceList) (*v2release.Release, error) {
+	type Msg struct {
+		r *v2release.Release
+		e error
+	}
+	resultChan := make(chan Msg, 1)
+
+	go func() {
+		i.goroutineCount.Add(1)
+		rel, err := i.performInstallV3(rel, toBeAdopted, resources)
+		resultChan <- Msg{rel, err}
+		i.goroutineCount.Add(-1)
+	}()
+	select {
+	case <-ctx.Done():
+		err := ctx.Err()
+		return rel, err
+	case msg := <-resultChan:
+		return msg.r, msg.e
+	}
+}
+
+func (i *Install) performInstallV3(rel *v2release.Release, toBeAdopted kube.ResourceList, resources kube.ResourceList) (*v2release.Release, error) {
+	var err error
+	// pre-install hooks
+	if !i.DisableHooks {
+		if err := i.cfg.execHookV3(rel, v2release.HookPreInstall, i.WaitStrategy, i.Timeout, i.ServerSideApply); err != nil {
+			return rel, fmt.Errorf("failed pre-install: %s", err)
+		}
+	}
+
+	if len(toBeAdopted) == 0 && len(resources) > 0 {
+		_, err = i.cfg.KubeClient.Create(
+			resources,
+			kube.ClientCreateOptionServerSideApply(i.ServerSideApply, false))
+	} else if len(resources) > 0 {
+		updateThreeWayMergeForUnstructured := i.TakeOwnership && !i.ServerSideApply
+		_, err = i.cfg.KubeClient.Update(
+			toBeAdopted,
+			resources,
+			kube.ClientUpdateOptionForceReplace(i.ForceReplace),
+			kube.ClientUpdateOptionServerSideApply(i.ServerSideApply, i.ForceConflicts),
+			kube.ClientUpdateOptionThreeWayMergeForUnstructured(updateThreeWayMergeForUnstructured),
+			kube.ClientUpdateOptionUpgradeClientSideFieldManager(true))
+	}
+	if err != nil {
+		return rel, err
+	}
+
+	waiter, err := i.cfg.KubeClient.GetWaiter(i.WaitStrategy)
+	if err != nil {
+		return rel, fmt.Errorf("failed to get waiter: %w", err)
+	}
+
+	if i.WaitForJobs {
+		err = waiter.WaitWithJobs(resources, i.Timeout)
+	} else {
+		err = waiter.Wait(resources, i.Timeout)
+	}
+	if err != nil {
+		return rel, err
+	}
+
+	if !i.DisableHooks {
+		if err := i.cfg.execHookV3(rel, v2release.HookPostInstall, i.WaitStrategy, i.Timeout, i.ServerSideApply); err != nil {
+			return rel, fmt.Errorf("failed post-install: %s", err)
+		}
+	}
+
+	if len(i.Description) > 0 {
+		rel.SetStatus(rcommon.StatusDeployed, i.Description)
+	} else {
+		rel.SetStatus(rcommon.StatusDeployed, "Install complete")
+	}
+
+	if err := i.recordReleaseV3(rel); err != nil {
+		i.cfg.Logger().Error("failed to record the release", slog.Any("error", err))
+	}
+
+	return rel, nil
+}
+
+func (i *Install) failReleaseV3(rel *v2release.Release, err error) (*v2release.Release, error) {
+	rel.SetStatus(rcommon.StatusFailed, fmt.Sprintf("Release %q failed: %s", i.ReleaseName, err.Error()))
+	if i.RollbackOnFailure {
+		i.cfg.Logger().Debug("install failed and rollback-on-failure is set, uninstalling release", "release", i.ReleaseName)
+		uninstall := NewUninstall(i.cfg)
+		uninstall.DisableHooks = i.DisableHooks
+		uninstall.KeepHistory = false
+		uninstall.Timeout = i.Timeout
+		uninstall.WaitStrategy = i.WaitStrategy
+		if _, uninstallErr := uninstall.Run(i.ReleaseName); uninstallErr != nil {
+			return rel, fmt.Errorf("an error occurred while uninstalling the release. original install error: %w: %w", err, uninstallErr)
+		}
+		return rel, fmt.Errorf("release %s failed, and has been uninstalled due to rollback-on-failure being set: %w", i.ReleaseName, err)
+	}
+	i.recordReleaseV3(rel) // Ignore the error, since we have another error to deal with.
+	return rel, err
+}
+
+func (i *Install) recordReleaseV3(r *v2release.Release) error {
+	return i.cfg.Releases.Update(r)
+}
+
+func (i *Install) replaceReleaseV3(rel *v2release.Release) error {
+	hist, err := i.cfg.Releases.History(rel.Name)
+	if err != nil || len(hist) == 0 {
+		return nil
+	}
+	hl, err := releaseListToV1List(hist)
+	if err != nil {
+		return err
+	}
+
+	releaseutil.Reverse(hl, releaseutil.SortByRevision)
+	last := hl[0]
+
+	rel.Version = last.Version + 1
+
+	if last.Info.Status == rcommon.StatusFailed {
+		return nil
+	}
+
+	last.SetStatus(rcommon.StatusSuperseded, "superseded by new release")
+	return i.recordRelease(last)
+}
+
 // availableName tests whether a name is available
 //
 // Roughly, this will return an error if name is
@@ -624,7 +906,33 @@ func releaseV1ListToReleaserList(ls []*release.Release) ([]ri.Releaser, error) {
 	return rls, nil
 }
 
-// createRelease creates a new release object
+func releaserToV2Release(rel ri.Releaser) (*v2release.Release, error) {
+	switch r := rel.(type) {
+	case v2release.Release:
+		return &r, nil
+	case *v2release.Release:
+		return r, nil
+	case nil:
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("unsupported release type for v2 conversion: %T", rel)
+	}
+}
+
+func releaseListToV2List(ls []ri.Releaser) ([]*v2release.Release, error) {
+	rls := make([]*v2release.Release, 0, len(ls))
+	for _, val := range ls {
+		rel, err := releaserToV2Release(val)
+		if err != nil {
+			return nil, err
+		}
+		rls = append(rls, rel)
+	}
+
+	return rls, nil
+}
+
+// createRelease creates a new release object for v2 charts
 func (i *Install) createRelease(chrt *chart.Chart, rawVals map[string]interface{}, labels map[string]string) *release.Release {
 	ts := i.cfg.Now()
 
@@ -634,6 +942,28 @@ func (i *Install) createRelease(chrt *chart.Chart, rawVals map[string]interface{
 		Chart:     chrt,
 		Config:    rawVals,
 		Info: &release.Info{
+			FirstDeployed: ts,
+			LastDeployed:  ts,
+			Status:        rcommon.StatusUnknown,
+		},
+		Version:     1,
+		Labels:      labels,
+		ApplyMethod: string(determineReleaseSSApplyMethod(i.ServerSideApply)),
+	}
+
+	return r
+}
+
+// createReleaseV3 creates a new release object for v3 charts
+func (i *Install) createReleaseV3(chrt *v3chart.Chart, rawVals map[string]interface{}, labels map[string]string) *v2release.Release {
+	ts := i.cfg.Now()
+
+	r := &v2release.Release{
+		Name:      i.ReleaseName,
+		Namespace: i.Namespace,
+		Chart:     chrt,
+		Config:    rawVals,
+		Info: &v2release.Info{
 			FirstDeployed: ts,
 			LastDeployed:  ts,
 			Status:        rcommon.StatusUnknown,

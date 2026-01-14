@@ -20,15 +20,19 @@ import (
 	"sort"
 	"strconv"
 
-	rspb "helm.sh/helm/v4/pkg/release/v1"
+	"helm.sh/helm/v4/pkg/release"
 )
 
 // records holds a list of in-memory release records
 type records []*record
 
-func (rs records) Len() int           { return len(rs) }
-func (rs records) Swap(i, j int)      { rs[i], rs[j] = rs[j], rs[i] }
-func (rs records) Less(i, j int) bool { return rs[i].rls.Version < rs[j].rls.Version }
+func (rs records) Len() int      { return len(rs) }
+func (rs records) Swap(i, j int) { rs[i], rs[j] = rs[j], rs[i] }
+func (rs records) Less(i, j int) bool {
+	aci, _ := release.NewAccessor(rs[i].rls)
+	acj, _ := release.NewAccessor(rs[j].rls)
+	return aci.Version() < acj.Version()
+}
 
 func (rs *records) Add(r *record) error {
 	if r == nil {
@@ -106,19 +110,20 @@ func (rs *records) removeAt(index int) *record {
 type record struct {
 	key string
 	lbs labels
-	rls *rspb.Release
+	rls release.Releaser
 }
 
 // newRecord creates a new in-memory release record
-func newRecord(key string, rls *rspb.Release) *record {
+func newRecord(key string, rls release.Releaser) *record {
 	var lbs labels
 
-	lbs.init()
-	lbs.set("name", rls.Name)
-	lbs.set("owner", "helm")
-	lbs.set("status", rls.Info.Status.String())
-	lbs.set("version", strconv.Itoa(rls.Version))
+	ac, _ := release.NewAccessor(rls)
 
-	// return &record{key: key, lbs: lbs, rls: proto.Clone(rls).(*rspb.Release)}
+	lbs.init()
+	lbs.set("name", ac.Name())
+	lbs.set("owner", "helm")
+	lbs.set("status", ac.Status())
+	lbs.set("version", strconv.Itoa(ac.Version()))
+
 	return &record{key: key, lbs: lbs, rls: rls}
 }

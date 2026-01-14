@@ -40,7 +40,11 @@ import (
 	"sigs.k8s.io/kustomize/kyaml/kio"
 	kyaml "sigs.k8s.io/kustomize/kyaml/yaml"
 
+	v3chart "helm.sh/helm/v4/internal/chart/v3"
 	"helm.sh/helm/v4/internal/logging"
+	v2release "helm.sh/helm/v4/internal/release/v2"
+	v2releaseutil "helm.sh/helm/v4/internal/release/v2/util"
+	ci "helm.sh/helm/v4/pkg/chart"
 	"helm.sh/helm/v4/pkg/chart/common"
 	chart "helm.sh/helm/v4/pkg/chart/v2"
 	chartutil "helm.sh/helm/v4/pkg/chart/v2/util"
@@ -214,28 +218,36 @@ func splitAndDeannotate(postrendered string) (map[string]string, error) {
 }
 
 // renderResources renders the templates in a chart
-//
-// TODO: This function is badly in need of a refactor.
-// TODO: As part of the refactor the duplicate code in cmd/helm/template.go should be removed
-//
-//	This code has to do with writing files to disk.
-func (cfg *Configuration) renderResources(ch *chart.Chart, values common.Values, releaseName, outputDir string, subNotes, useReleaseName, includeCrds bool, pr postrenderer.PostRenderer, interactWithRemote, enableDNS, hideSecret bool) ([]*release.Hook, *bytes.Buffer, string, error) {
-	var hs []*release.Hook
-	b := bytes.NewBuffer(nil)
+// renderResult holds the intermediate results from rendering templates.
+type renderResult struct {
+	files map[string]string
+	notes string
+}
+
+// renderTemplates renders templates for any chart type and returns intermediate results.
+// This is the common rendering logic shared between v2 and v3 charts.
+func (cfg *Configuration) renderTemplates(ch ci.Charter, values common.Values, subNotes bool, pr postrenderer.PostRenderer, interactWithRemote, enableDNS bool) (*renderResult, error) {
+	ac, err := ci.NewAccessor(ch)
+	if err != nil {
+		return nil, err
+	}
 
 	caps, err := cfg.getCapabilities()
 	if err != nil {
-		return hs, b, "", err
+		return nil, err
 	}
 
-	if ch.Metadata.KubeVersion != "" {
-		if !chartutil.IsCompatibleRange(ch.Metadata.KubeVersion, caps.KubeVersion.String()) {
-			return hs, b, "", fmt.Errorf("chart requires kubeVersion: %s which is incompatible with Kubernetes %s", ch.Metadata.KubeVersion, caps.KubeVersion.Version)
+	// Check KubeVersion compatibility using metadata map
+	if metadata := ac.MetadataAsMap(); metadata != nil {
+		if kubeVersion, ok := metadata["KubeVersion"].(string); ok && kubeVersion != "" {
+			if !chartutil.IsCompatibleRange(kubeVersion, caps.KubeVersion.String()) {
+				return nil, fmt.Errorf("chart requires kubeVersion: %s which is incompatible with Kubernetes %s", kubeVersion, caps.KubeVersion.Version)
+			}
 		}
 	}
 
 	var files map[string]string
-	var err2 error
+	var renderErr error
 
 	// A `helm template` should not talk to the remote cluster. However, commands with the flag
 	// `--dry-run` with the value of `false`, `none`, or `server` should try to interact with the cluster.
@@ -243,23 +255,21 @@ func (cfg *Configuration) renderResources(ch *chart.Chart, values common.Values,
 	if interactWithRemote && cfg.RESTClientGetter != nil {
 		restConfig, err := cfg.RESTClientGetter.ToRESTConfig()
 		if err != nil {
-			return hs, b, "", err
+			return nil, err
 		}
 		e := engine.New(restConfig)
 		e.EnableDNS = enableDNS
 		e.CustomTemplateFuncs = cfg.CustomTemplateFuncs
-
-		files, err2 = e.Render(ch, values)
+		files, renderErr = e.Render(ch, values)
 	} else {
 		var e engine.Engine
 		e.EnableDNS = enableDNS
 		e.CustomTemplateFuncs = cfg.CustomTemplateFuncs
-
-		files, err2 = e.Render(ch, values)
+		files, renderErr = e.Render(ch, values)
 	}
 
-	if err2 != nil {
-		return hs, b, "", err2
+	if renderErr != nil {
+		return nil, renderErr
 	}
 
 	// NOTES.txt gets rendered like all the other files, but because it's not a hook nor a resource,
@@ -267,11 +277,11 @@ func (cfg *Configuration) renderResources(ch *chart.Chart, values common.Values,
 	// text file. We have to spin through this map because the file contains path information, so we
 	// look for terminating NOTES.txt. We also remove it from the files so that we don't have to skip
 	// it in the sortHooks.
+	chartName := ac.Name()
 	var notesBuffer bytes.Buffer
 	for k, v := range files {
 		if strings.HasSuffix(k, notesFileSuffix) {
-			if subNotes || (k == path.Join(ch.Name(), "templates", notesFileSuffix)) {
-				// If buffer contains data, add newline before adding more
+			if subNotes || (k == path.Join(chartName, "templates", notesFileSuffix)) {
 				if notesBuffer.Len() > 0 {
 					notesBuffer.WriteString("\n")
 				}
@@ -280,70 +290,34 @@ func (cfg *Configuration) renderResources(ch *chart.Chart, values common.Values,
 			delete(files, k)
 		}
 	}
-	notes := notesBuffer.String()
 
 	if pr != nil {
 		// We need to send files to the post-renderer before sorting and splitting
 		// hooks from manifests. The post-renderer interface expects a stream of
 		// manifests (similar to what tools like Kustomize and kubectl expect), whereas
 		// the sorter uses filenames.
-		// Here, we merge the documents into a stream, post-render them, and then split
-		// them back into a map of filename -> content.
-
-		// Merge files as stream of documents for sending to post renderer
 		merged, err := annotateAndMerge(files)
 		if err != nil {
-			return hs, b, notes, fmt.Errorf("error merging manifests: %w", err)
+			return &renderResult{files: files, notes: notesBuffer.String()}, fmt.Errorf("error merging manifests: %w", err)
 		}
 
-		// Run the post renderer
 		postRendered, err := pr.Run(bytes.NewBufferString(merged))
 		if err != nil {
-			return hs, b, notes, fmt.Errorf("error while running post render on files: %w", err)
+			return &renderResult{files: files, notes: notesBuffer.String()}, fmt.Errorf("error while running post render on files: %w", err)
 		}
 
-		// Use the file list and contents received from the post renderer
 		files, err = splitAndDeannotate(postRendered.String())
 		if err != nil {
-			return hs, b, notes, fmt.Errorf("error while parsing post rendered output: %w", err)
+			return &renderResult{files: files, notes: notesBuffer.String()}, fmt.Errorf("error while parsing post rendered output: %w", err)
 		}
 	}
 
-	// Sort hooks, manifests, and partials. Only hooks and manifests are returned,
-	// as partials are not used after renderer.Render. Empty manifests are also
-	// removed here.
-	hs, manifests, err := releaseutil.SortManifests(files, nil, releaseutil.InstallOrder)
-	if err != nil {
-		// By catching parse errors here, we can prevent bogus releases from going
-		// to Kubernetes.
-		//
-		// We return the files as a big blob of data to help the user debug parser
-		// errors.
-		for name, content := range files {
-			if strings.TrimSpace(content) == "" {
-				continue
-			}
-			fmt.Fprintf(b, "---\n# Source: %s\n%s\n", name, content)
-		}
-		return hs, b, "", err
-	}
+	return &renderResult{files: files, notes: notesBuffer.String()}, nil
+}
 
-	// Aggregate all valid manifests into one big doc.
+// writeManifests writes sorted manifests to the buffer or output directory.
+func writeManifests(b *bytes.Buffer, manifests []releaseutil.Manifest, releaseName, outputDir string, useReleaseName, hideSecret bool) error {
 	fileWritten := make(map[string]bool)
-
-	if includeCrds {
-		for _, crd := range ch.CRDObjects() {
-			if outputDir == "" {
-				fmt.Fprintf(b, "---\n# Source: %s\n%s\n", crd.Filename, string(crd.File.Data[:]))
-			} else {
-				err = writeToFile(outputDir, crd.Filename, string(crd.File.Data[:]), fileWritten[crd.Filename])
-				if err != nil {
-					return hs, b, "", err
-				}
-				fileWritten[crd.Filename] = true
-			}
-		}
-	}
 
 	for _, m := range manifests {
 		if outputDir == "" {
@@ -357,19 +331,149 @@ func (cfg *Configuration) renderResources(ch *chart.Chart, values common.Values,
 			if useReleaseName {
 				newDir = filepath.Join(outputDir, releaseName)
 			}
-			// NOTE: We do not have to worry about the post-renderer because
-			// output dir is only used by `helm template`. In the next major
-			// release, we should move this logic to template only as it is not
-			// used by install or upgrade
-			err = writeToFile(newDir, m.Name, m.Content, fileWritten[m.Name])
+			err := writeToFile(newDir, m.Name, m.Content, fileWritten[m.Name])
 			if err != nil {
-				return hs, b, "", err
+				return err
 			}
 			fileWritten[m.Name] = true
 		}
 	}
+	return nil
+}
 
-	return hs, b, notes, nil
+// TODO: This function is badly in need of a refactor.
+// TODO: As part of the refactor the duplicate code in cmd/helm/template.go should be removed
+//
+//	This code has to do with writing files to disk.
+func (cfg *Configuration) renderResources(ch *chart.Chart, values common.Values, releaseName, outputDir string, subNotes, useReleaseName, includeCrds bool, pr postrenderer.PostRenderer, interactWithRemote, enableDNS, hideSecret bool) ([]*release.Hook, *bytes.Buffer, string, error) {
+	var hs []*release.Hook
+	b := bytes.NewBuffer(nil)
+
+	result, err := cfg.renderTemplates(ch, values, subNotes, pr, interactWithRemote, enableDNS)
+	if err != nil {
+		if result != nil {
+			return hs, b, result.notes, err
+		}
+		return hs, b, "", err
+	}
+
+	// Sort hooks, manifests, and partials. Only hooks and manifests are returned,
+	// as partials are not used after renderer.Render. Empty manifests are also
+	// removed here.
+	hs, manifests, err := releaseutil.SortManifests(result.files, nil, releaseutil.InstallOrder)
+	if err != nil {
+		// By catching parse errors here, we can prevent bogus releases from going
+		// to Kubernetes.
+		//
+		// We return the files as a big blob of data to help the user debug parser
+		// errors.
+		for name, content := range result.files {
+			if strings.TrimSpace(content) == "" {
+				continue
+			}
+			fmt.Fprintf(b, "---\n# Source: %s\n%s\n", name, content)
+		}
+		return hs, b, "", err
+	}
+
+	// Write CRDs if requested
+	if includeCrds {
+		fileWritten := make(map[string]bool)
+		for _, crd := range ch.CRDObjects() {
+			if outputDir == "" {
+				fmt.Fprintf(b, "---\n# Source: %s\n%s\n", crd.Filename, string(crd.File.Data[:]))
+			} else {
+				err = writeToFile(outputDir, crd.Filename, string(crd.File.Data[:]), fileWritten[crd.Filename])
+				if err != nil {
+					return hs, b, "", err
+				}
+				fileWritten[crd.Filename] = true
+			}
+		}
+	}
+
+	// Write manifests
+	if err := writeManifests(b, manifests, releaseName, outputDir, useReleaseName, hideSecret); err != nil {
+		return hs, b, "", err
+	}
+
+	return hs, b, result.notes, nil
+}
+
+// renderResourcesV3 renders the templates in a v3 chart
+func (cfg *Configuration) renderResourcesV3(ch *v3chart.Chart, values common.Values, releaseName, outputDir string, subNotes, useReleaseName, includeCrds bool, pr postrenderer.PostRenderer, interactWithRemote, enableDNS, hideSecret bool) ([]*v2release.Hook, *bytes.Buffer, string, error) {
+	var hs []*v2release.Hook
+	b := bytes.NewBuffer(nil)
+
+	// Use common rendering logic
+	result, err := cfg.renderTemplates(ch, values, subNotes, pr, interactWithRemote, enableDNS)
+	if err != nil {
+		if result != nil {
+			return hs, b, result.notes, err
+		}
+		return hs, b, "", err
+	}
+
+	// Use v2 SortManifests for v3 charts (different hook/manifest types)
+	hs, manifests, err := v2releaseutil.SortManifests(result.files, nil, v2releaseutil.InstallOrder)
+	if err != nil {
+		for name, content := range result.files {
+			if strings.TrimSpace(content) == "" {
+				continue
+			}
+			fmt.Fprintf(b, "---\n# Source: %s\n%s\n", name, content)
+		}
+		return hs, b, "", err
+	}
+
+	// Write CRDs if requested
+	if includeCrds {
+		fileWritten := make(map[string]bool)
+		for _, crd := range ch.CRDObjects() {
+			if outputDir == "" {
+				fmt.Fprintf(b, "---\n# Source: %s\n%s\n", crd.Filename, string(crd.File.Data[:]))
+			} else {
+				err = writeToFile(outputDir, crd.Filename, string(crd.File.Data[:]), fileWritten[crd.Filename])
+				if err != nil {
+					return hs, b, "", err
+				}
+				fileWritten[crd.Filename] = true
+			}
+		}
+	}
+
+	// Write manifests using helper (v2releaseutil.Manifest has same structure as releaseutil.Manifest)
+	if err := writeManifestsV3(b, manifests, releaseName, outputDir, useReleaseName, hideSecret); err != nil {
+		return hs, b, "", err
+	}
+
+	return hs, b, result.notes, nil
+}
+
+// writeManifestsV3 writes sorted manifests for v3 charts (v2 release format).
+func writeManifestsV3(b *bytes.Buffer, manifests []v2releaseutil.Manifest, releaseName, outputDir string, useReleaseName, hideSecret bool) error {
+	fileWritten := make(map[string]bool)
+
+	for _, m := range manifests {
+		if outputDir == "" {
+			if hideSecret && m.Head.Kind == "Secret" && m.Head.Version == "v1" {
+				fmt.Fprintf(b, "---\n# Source: %s\n# HIDDEN: The Secret output has been suppressed\n", m.Name)
+			} else {
+				fmt.Fprintf(b, "---\n# Source: %s\n%s\n", m.Name, m.Content)
+			}
+		} else {
+			newDir := outputDir
+			if useReleaseName {
+				newDir = filepath.Join(outputDir, releaseName)
+			}
+			err := writeToFile(newDir, m.Name, m.Content, fileWritten[m.Name])
+			if err != nil {
+				return err
+			}
+			fileWritten[m.Name] = true
+		}
+	}
+	return nil
 }
 
 // RESTClientGetter gets the rest client

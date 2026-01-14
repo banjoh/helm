@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 
+	v2rspb "helm.sh/helm/v4/internal/release/v2"
 	"helm.sh/helm/v4/pkg/release"
 	rspb "helm.sh/helm/v4/pkg/release/v1"
 )
@@ -116,5 +117,30 @@ func releaserToV1Release(rel release.Releaser) (*rspb.Release, error) {
 		return nil, nil
 	default:
 		return nil, fmt.Errorf("unsupported release type: %T", rel)
+	}
+}
+
+// releaserToV2Release is a helper function to convert a v2 release passed by interface
+// into the type object.
+func releaserToV2Release(rel release.Releaser) (*v2rspb.Release, error) {
+	switch r := rel.(type) {
+	case v2rspb.Release:
+		return &r, nil
+	case *v2rspb.Release:
+		return r, nil
+	case nil:
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("unsupported release type for v2 conversion: %T", rel)
+	}
+}
+
+// isV2Release checks if a Releaser is a v2 release
+func isV2Release(rel release.Releaser) bool {
+	switch rel.(type) {
+	case v2rspb.Release, *v2rspb.Release:
+		return true
+	default:
+		return false
 	}
 }

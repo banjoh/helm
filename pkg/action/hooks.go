@@ -19,7 +19,6 @@ import (
 	"bytes"
 	"fmt"
 	"log"
-	"slices"
 	"sort"
 	"time"
 
@@ -28,6 +27,8 @@ import (
 	"go.yaml.in/yaml/v3"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	v2release "helm.sh/helm/v4/internal/release/v2"
+	ri "helm.sh/helm/v4/pkg/release"
 	release "helm.sh/helm/v4/pkg/release/v1"
 )
 
@@ -52,53 +53,54 @@ func shutdownNoOp() error {
 	return nil
 }
 
-// execHookWithDelayedShutdown executes all of the hooks for the given hook event and returns a shutdownHook function to trigger deletions after doing other things like e.g. retrieving logs.
-func (cfg *Configuration) execHookWithDelayedShutdown(rl *release.Release, hook release.HookEvent, waitStrategy kube.WaitStrategy, timeout time.Duration, serverSideApply bool) (ExecuteShutdownFunc, error) {
-	executingHooks := []*release.Hook{}
+// hookExecutionCallbacks holds the callbacks needed for hook execution.
+// This allows the core hook logic to work with both v1 and v2 releases.
+type hookExecutionCallbacks struct {
+	recordRelease      func()
+	deleteByPolicy     func(hook ri.HookAccessor, policy string) error
+	outputLogsByPolicy func(hook ri.HookAccessor, policy string) error
+}
 
-	for _, h := range rl.Hooks {
-		for _, e := range h.Events {
-			if e == hook {
-				executingHooks = append(executingHooks, h)
-			}
+// execHookCore is the core hook execution logic that works with HookAccessor interface.
+// It takes hooks as accessors and uses callbacks for release-type-specific operations.
+func (cfg *Configuration) execHookCore(executingHooks []ri.HookAccessor, hookEvent string, _ string, waitStrategy kube.WaitStrategy, timeout time.Duration, serverSideApply bool, callbacks hookExecutionCallbacks) (ExecuteShutdownFunc, error) {
+	// Sort by weight (hooks are pre-ordered by kind, so keep order stable)
+	sort.SliceStable(executingHooks, func(i, j int) bool {
+		if executingHooks[i].Weight() == executingHooks[j].Weight() {
+			return executingHooks[i].Name() < executingHooks[j].Name()
 		}
-	}
-
-	// hooke are pre-ordered by kind, so keep order stable
-	sort.Stable(hookByWeight(executingHooks))
+		return executingHooks[i].Weight() < executingHooks[j].Weight()
+	})
 
 	for i, h := range executingHooks {
 		// Set default delete policy to before-hook-creation
-		cfg.hookSetDeletePolicy(h)
+		h.SetDefaultDeletePolicy()
 
-		if err := cfg.deleteHookByPolicy(h, release.HookBeforeHookCreation, waitStrategy, timeout); err != nil {
+		if err := callbacks.deleteByPolicy(h, ri.HookDeletePolicyBeforeCreation); err != nil {
 			return shutdownNoOp, err
 		}
 
-		resources, err := cfg.KubeClient.Build(bytes.NewBufferString(h.Manifest), true)
+		resources, err := cfg.KubeClient.Build(bytes.NewBufferString(h.Manifest()), true)
 		if err != nil {
-			return shutdownNoOp, fmt.Errorf("unable to build kubernetes object for %s hook %s: %w", hook, h.Path, err)
+			return shutdownNoOp, fmt.Errorf("unable to build kubernetes object for %s hook %s: %w", hookEvent, h.Path(), err)
 		}
 
 		// Record the time at which the hook was applied to the cluster
-		h.LastRun = release.HookExecution{
-			StartedAt: time.Now(),
-			Phase:     release.HookPhaseRunning,
-		}
-		cfg.recordRelease(rl)
+		h.SetLastRunStarted()
+		callbacks.recordRelease()
 
 		// As long as the implementation of WatchUntilReady does not panic, HookPhaseFailed or HookPhaseSucceeded
 		// should always be set by this function. If we fail to do that for any reason, then HookPhaseUnknown is
 		// the most appropriate value to surface.
-		h.LastRun.Phase = release.HookPhaseUnknown
+		h.SetLastRunPhase(ri.HookPhaseUnknown)
 
 		// Create hook resources
 		if _, err := cfg.KubeClient.Create(
 			resources,
 			kube.ClientCreateOptionServerSideApply(serverSideApply, false)); err != nil {
-			h.LastRun.CompletedAt = time.Now()
-			h.LastRun.Phase = release.HookPhaseFailed
-			return shutdownNoOp, fmt.Errorf("warning: Hook %s %s failed: %w", hook, h.Path, err)
+			h.SetLastRunCompleted()
+			h.SetLastRunPhase(ri.HookPhaseFailed)
+			return shutdownNoOp, fmt.Errorf("warning: Hook %s %s failed: %w", hookEvent, h.Path(), err)
 		}
 
 		waiter, err := cfg.KubeClient.GetWaiter(waitStrategy)
@@ -108,49 +110,71 @@ func (cfg *Configuration) execHookWithDelayedShutdown(rl *release.Release, hook 
 		// Watch hook resources until they have completed
 		err = waiter.WatchUntilReady(resources, timeout)
 		// Note the time of success/failure
-		h.LastRun.CompletedAt = time.Now()
+		h.SetLastRunCompleted()
 		// Mark hook as succeeded or failed
 		if err != nil {
-			h.LastRun.Phase = release.HookPhaseFailed
+			h.SetLastRunPhase(ri.HookPhaseFailed)
 			// If a hook is failed, check the annotation of the hook to determine if we should copy the logs client side
-			if errOutputting := cfg.outputLogsByPolicy(h, rl.Namespace, release.HookOutputOnFailed); errOutputting != nil {
-				// We log the error here as we want to propagate the hook failure upwards to the release object.
+			if errOutputting := callbacks.outputLogsByPolicy(h, ri.HookOutputPolicyFailed); errOutputting != nil {
 				log.Printf("error outputting logs for hook failure: %v", errOutputting)
 			}
-			// If a hook is failed, check the annotation of the hook to determine whether the hook should be deleted
-			// under failed condition. If so, then clear the corresponding resource object in the hook
+			// Return a function to clean up on failure
 			return func() error {
-				if errDeleting := cfg.deleteHookByPolicy(h, release.HookFailed, waitStrategy, timeout); errDeleting != nil {
-					// We log the error here as we want to propagate the hook failure upwards to the release object.
+				if errDeleting := callbacks.deleteByPolicy(h, ri.HookDeletePolicyFailed); errDeleting != nil {
 					log.Printf("error deleting the hook resource on hook failure: %v", errDeleting)
 				}
-
-				// If a hook is failed, check the annotation of the previous successful hooks to determine whether the hooks
-				// should be deleted under succeeded condition.
-				if err := cfg.deleteHooksByPolicy(executingHooks[0:i], release.HookSucceeded, waitStrategy, timeout); err != nil {
-					return err
+				// Delete previous successful hooks
+				for j := 0; j < i; j++ {
+					if err := callbacks.deleteByPolicy(executingHooks[j], ri.HookDeletePolicySucceeded); err != nil {
+						return err
+					}
 				}
 				return err
 			}, err
 		}
-		h.LastRun.Phase = release.HookPhaseSucceeded
+		h.SetLastRunPhase(ri.HookPhaseSucceeded)
 	}
 
 	return func() error {
-		// If all hooks are successful, check the annotation of each hook to determine whether the hook should be deleted
-		// or output should be logged under succeeded condition. If so, then clear the corresponding resource object in each hook
+		// If all hooks are successful, clean up and output logs
 		for i := len(executingHooks) - 1; i >= 0; i-- {
 			h := executingHooks[i]
-			if err := cfg.outputLogsByPolicy(h, rl.Namespace, release.HookOutputOnSucceeded); err != nil {
-				// We log here as we still want to attempt hook resource deletion even if output logging fails.
-				log.Printf("error outputting logs for hook failure: %v", err)
+			if err := callbacks.outputLogsByPolicy(h, ri.HookOutputPolicySucceeded); err != nil {
+				log.Printf("error outputting logs for hook success: %v", err)
 			}
-			if err := cfg.deleteHookByPolicy(h, release.HookSucceeded, waitStrategy, timeout); err != nil {
+			if err := callbacks.deleteByPolicy(h, ri.HookDeletePolicySucceeded); err != nil {
 				return err
 			}
 		}
 		return nil
 	}, nil
+}
+
+// execHookWithDelayedShutdown executes all of the hooks for the given hook event and returns a shutdownHook function to trigger deletions after doing other things like e.g. retrieving logs.
+func (cfg *Configuration) execHookWithDelayedShutdown(rl *release.Release, hook release.HookEvent, waitStrategy kube.WaitStrategy, timeout time.Duration, serverSideApply bool) (ExecuteShutdownFunc, error) {
+	// Build list of hooks matching this event as accessors
+	var executingHooks []ri.HookAccessor
+	for _, h := range rl.Hooks {
+		for _, e := range h.Events {
+			if e == hook {
+				// NewHookAccessor cannot fail for known hook types (*release.Hook)
+				acc, _ := ri.NewHookAccessor(h)
+				executingHooks = append(executingHooks, acc)
+			}
+		}
+	}
+
+	callbacks := hookExecutionCallbacks{
+		recordRelease: func() { cfg.recordRelease(rl) },
+		deleteByPolicy: func(h ri.HookAccessor, policy string) error {
+			return cfg.deleteHookByPolicyGeneric(h, policy, waitStrategy, timeout)
+		},
+		outputLogsByPolicy: func(h ri.HookAccessor, policy string) error {
+			return cfg.outputLogsByPolicyGeneric(h, rl.Namespace, policy)
+		},
+	}
+
+	return cfg.execHookCore(executingHooks, string(hook), rl.Namespace, waitStrategy, timeout, serverSideApply, callbacks)
 }
 
 // hookByWeight is a sorter for hooks
@@ -165,17 +189,35 @@ func (x hookByWeight) Less(i, j int) bool {
 	return x[i].Weight < x[j].Weight
 }
 
-// deleteHookByPolicy deletes a hook if the hook policy instructs it to
-func (cfg *Configuration) deleteHookByPolicy(h *release.Hook, policy release.HookDeletePolicy, waitStrategy kube.WaitStrategy, timeout time.Duration) error {
+// hookSetDeletePolicy sets the default delete policy on a hook if none is set.
+func (cfg *Configuration) hookSetDeletePolicy(h *release.Hook) {
+	cfg.mutex.Lock()
+	defer cfg.mutex.Unlock()
+	if len(h.DeletePolicies) == 0 {
+		h.DeletePolicies = []release.HookDeletePolicy{release.HookBeforeHookCreation}
+	}
+}
+
+func (cfg *Configuration) outputContainerLogsForListOptions(namespace string, listOptions metav1.ListOptions) error {
+	podList, err := cfg.KubeClient.GetPodList(namespace, listOptions)
+	if err != nil {
+		return err
+	}
+
+	return cfg.KubeClient.OutputContainerLogsForPodList(podList, namespace, cfg.HookOutputFunc)
+}
+
+// deleteHookByPolicyGeneric deletes a hook using the HookAccessor interface.
+func (cfg *Configuration) deleteHookByPolicyGeneric(h ri.HookAccessor, policy string, waitStrategy kube.WaitStrategy, timeout time.Duration) error {
 	// Never delete CustomResourceDefinitions; this could cause lots of
 	// cascading garbage collection.
-	if h.Kind == "CustomResourceDefinition" {
+	if h.Kind() == "CustomResourceDefinition" {
 		return nil
 	}
-	if cfg.hookHasDeletePolicy(h, policy) {
-		resources, err := cfg.KubeClient.Build(bytes.NewBufferString(h.Manifest), false)
+	if h.HasDeletePolicy(policy) {
+		resources, err := cfg.KubeClient.Build(bytes.NewBufferString(h.Manifest()), false)
 		if err != nil {
-			return fmt.Errorf("unable to build kubernetes object for deleting hook %s: %w", h.Path, err)
+			return fmt.Errorf("unable to build kubernetes object for deleting hook %s: %w", h.Path(), err)
 		}
 		_, errs := cfg.KubeClient.Delete(resources, metav1.DeletePropagationBackground)
 		if len(errs) > 0 {
@@ -193,76 +235,35 @@ func (cfg *Configuration) deleteHookByPolicy(h *release.Hook, policy release.Hoo
 	return nil
 }
 
-// deleteHooksByPolicy deletes all hooks if the hook policy instructs it to
-func (cfg *Configuration) deleteHooksByPolicy(hooks []*release.Hook, policy release.HookDeletePolicy, waitStrategy kube.WaitStrategy, timeout time.Duration) error {
-	for _, h := range hooks {
-		if err := cfg.deleteHookByPolicy(h, policy, waitStrategy, timeout); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// hookHasDeletePolicy determines whether the defined hook deletion policy matches the hook deletion polices
-// supported by helm. If so, mark the hook as one should be deleted.
-func (cfg *Configuration) hookHasDeletePolicy(h *release.Hook, policy release.HookDeletePolicy) bool {
-	cfg.mutex.Lock()
-	defer cfg.mutex.Unlock()
-	return slices.Contains(h.DeletePolicies, policy)
-}
-
-// hookSetDeletePolicy determines whether the defined hook deletion policy matches the hook deletion polices
-// supported by helm. If so, mark the hook as one should be deleted.
-func (cfg *Configuration) hookSetDeletePolicy(h *release.Hook) {
-	cfg.mutex.Lock()
-	defer cfg.mutex.Unlock()
-	if len(h.DeletePolicies) == 0 {
-		// TODO(jlegrone): Only apply before-hook-creation delete policy to run to completion
-		//                 resources. For all other resource types update in place if a
-		//                 resource with the same name already exists and is owned by the
-		//                 current release.
-		h.DeletePolicies = []release.HookDeletePolicy{release.HookBeforeHookCreation}
-	}
-}
-
-// outputLogsByPolicy outputs a pods logs if the hook policy instructs it to
-func (cfg *Configuration) outputLogsByPolicy(h *release.Hook, releaseNamespace string, policy release.HookOutputLogPolicy) error {
-	if !hookHasOutputLogPolicy(h, policy) {
+// outputLogsByPolicyGeneric outputs a pod's logs using the HookAccessor interface.
+func (cfg *Configuration) outputLogsByPolicyGeneric(h ri.HookAccessor, releaseNamespace string, policy string) error {
+	if !h.HasOutputLogPolicy(policy) {
 		return nil
 	}
-	namespace, err := cfg.deriveNamespace(h, releaseNamespace)
+	namespace, err := cfg.deriveNamespaceGeneric(h, releaseNamespace)
 	if err != nil {
 		return err
 	}
-	switch h.Kind {
+	switch h.Kind() {
 	case "Job":
-		return cfg.outputContainerLogsForListOptions(namespace, metav1.ListOptions{LabelSelector: fmt.Sprintf("job-name=%s", h.Name)})
+		return cfg.outputContainerLogsForListOptions(namespace, metav1.ListOptions{LabelSelector: fmt.Sprintf("job-name=%s", h.Name())})
 	case "Pod":
-		return cfg.outputContainerLogsForListOptions(namespace, metav1.ListOptions{FieldSelector: fmt.Sprintf("metadata.name=%s", h.Name)})
+		return cfg.outputContainerLogsForListOptions(namespace, metav1.ListOptions{FieldSelector: fmt.Sprintf("metadata.name=%s", h.Name())})
 	default:
 		return nil
 	}
 }
 
-func (cfg *Configuration) outputContainerLogsForListOptions(namespace string, listOptions metav1.ListOptions) error {
-	podList, err := cfg.KubeClient.GetPodList(namespace, listOptions)
-	if err != nil {
-		return err
-	}
-
-	return cfg.KubeClient.OutputContainerLogsForPodList(podList, namespace, cfg.HookOutputFunc)
-}
-
-func (cfg *Configuration) deriveNamespace(h *release.Hook, namespace string) (string, error) {
+// deriveNamespaceGeneric extracts namespace from hook manifest using the HookAccessor interface.
+func (cfg *Configuration) deriveNamespaceGeneric(h ri.HookAccessor, namespace string) (string, error) {
 	tmp := struct {
 		Metadata struct {
 			Namespace string
 		}
 	}{}
-	err := yaml.Unmarshal([]byte(h.Manifest), &tmp)
+	err := yaml.Unmarshal([]byte(h.Manifest()), &tmp)
 	if err != nil {
-		return "", fmt.Errorf("unable to parse metadata.namespace from kubernetes manifest for output logs hook %s: %w", h.Path, err)
+		return "", fmt.Errorf("unable to parse metadata.namespace from kubernetes manifest for output logs hook %s: %w", h.Path(), err)
 	}
 	if tmp.Metadata.Namespace == "" {
 		return namespace, nil
@@ -270,8 +271,52 @@ func (cfg *Configuration) deriveNamespace(h *release.Hook, namespace string) (st
 	return tmp.Metadata.Namespace, nil
 }
 
-// hookHasOutputLogPolicy determines whether the defined hook output log policy matches the hook output log policies
-// supported by helm.
-func hookHasOutputLogPolicy(h *release.Hook, policy release.HookOutputLogPolicy) bool {
-	return slices.Contains(h.OutputLogPolicies, policy)
+// V3 versions of hook functions
+
+// execHookV3 executes all of the hooks for the given hook event on a v3 release.
+func (cfg *Configuration) execHookV3(rl *v2release.Release, hook v2release.HookEvent, waitStrategy kube.WaitStrategy, timeout time.Duration, serverSideApply bool) error {
+	shutdown, err := cfg.execHookWithDelayedShutdownV3(rl, hook, waitStrategy, timeout, serverSideApply)
+	if shutdown == nil {
+		return err
+	}
+	if err != nil {
+		if err := shutdown(); err != nil {
+			return err
+		}
+		return err
+	}
+	return shutdown()
+}
+
+// execHookWithDelayedShutdownV3 executes all of the hooks for the given hook event for v3 charts.
+// It uses the shared execHookCore function to avoid code duplication.
+func (cfg *Configuration) execHookWithDelayedShutdownV3(rl *v2release.Release, hook v2release.HookEvent, waitStrategy kube.WaitStrategy, timeout time.Duration, serverSideApply bool) (ExecuteShutdownFunc, error) {
+	// Build list of hooks matching this event as accessors
+	var executingHooks []ri.HookAccessor
+	for _, h := range rl.Hooks {
+		for _, e := range h.Events {
+			if e == hook {
+				// NewHookAccessor cannot fail for known hook types (*v2release.Hook)
+				acc, _ := ri.NewHookAccessor(h)
+				executingHooks = append(executingHooks, acc)
+			}
+		}
+	}
+
+	callbacks := hookExecutionCallbacks{
+		recordRelease: func() { cfg.Releases.Update(rl) },
+		deleteByPolicy: func(h ri.HookAccessor, policy string) error {
+			return cfg.deleteHookByPolicyGeneric(h, policy, waitStrategy, timeout)
+		},
+		outputLogsByPolicy: func(h ri.HookAccessor, policy string) error {
+			return cfg.outputLogsByPolicyGeneric(h, rl.Namespace, policy)
+		},
+	}
+
+	return cfg.execHookCore(executingHooks, string(hook), rl.Namespace, waitStrategy, timeout, serverSideApply, callbacks)
+}
+
+// recordReleaseV3 records a v2 release with an update operation.
+func (cfg *Configuration) recordReleaseV3(rl *v2release.Release) error {
+	return cfg.Releases.Update(rl)
 }

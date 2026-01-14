@@ -28,6 +28,7 @@ import (
 
 	c3 "helm.sh/helm/v4/internal/chart/v3"
 	c3load "helm.sh/helm/v4/internal/chart/v3/loader"
+	"helm.sh/helm/v4/internal/gates"
 	"helm.sh/helm/v4/pkg/chart"
 	"helm.sh/helm/v4/pkg/chart/loader/archive"
 	c2 "helm.sh/helm/v4/pkg/chart/v2"
@@ -96,6 +97,9 @@ func LoadDir(dir string) (chart.Charter, error) {
 	case c2.APIVersionV1, c2.APIVersionV2, "":
 		return c2load.Load(dir)
 	case c3.APIVersionV3:
+		if !gates.ChartV3.IsEnabled() {
+			return nil, gates.ChartV3.Error()
+		}
 		return c3load.Load(dir)
 	default:
 		return nil, errors.New("unsupported chart version")
@@ -147,6 +151,9 @@ func LoadFile(name string) (chart.Charter, error) {
 			case c2.APIVersionV1, c2.APIVersionV2, "":
 				return c2load.Load(name)
 			case c3.APIVersionV3:
+				if !gates.ChartV3.IsEnabled() {
+					return nil, gates.ChartV3.Error()
+				}
 				return c3load.Load(name)
 			default:
 				return nil, errors.New("unsupported chart version")
@@ -179,6 +186,9 @@ func LoadArchive(in io.Reader) (chart.Charter, error) {
 			case c2.APIVersionV1, c2.APIVersionV2, "":
 				return c2load.LoadFiles(files)
 			case c3.APIVersionV3:
+				if !gates.ChartV3.IsEnabled() {
+					return nil, gates.ChartV3.Error()
+				}
 				return c3load.LoadFiles(files)
 			default:
 				return nil, errors.New("unsupported chart version")

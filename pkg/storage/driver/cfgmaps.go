@@ -32,6 +32,7 @@ import (
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 
 	"helm.sh/helm/v4/internal/logging"
+	v2rspb "helm.sh/helm/v4/internal/release/v2"
 	"helm.sh/helm/v4/pkg/release"
 	rspb "helm.sh/helm/v4/pkg/release/v1"
 )
@@ -78,7 +79,19 @@ func (cfgmaps *ConfigMaps) Get(key string) (release.Releaser, error) {
 		cfgmaps.Logger().Debug("failed to get release", slog.String("key", key), slog.Any("error", err))
 		return nil, err
 	}
-	// found the configmap, decode the base64 data string
+
+	// Check if this is a v2 release
+	if obj.Labels["releaseType"] == "v2" {
+		r, err := decodeReleaseV2(obj.Data["release"])
+		if err != nil {
+			cfgmaps.Logger().Debug("failed to decode v2 data", slog.String("key", key), slog.Any("error", err))
+			return nil, err
+		}
+		r.Labels = filterSystemLabels(obj.Labels)
+		return r, nil
+	}
+
+	// Default to v1 release
 	r, err := decodeRelease(obj.Data["release"])
 	if err != nil {
 		cfgmaps.Logger().Debug("failed to decode data", slog.String("key", key), slog.Any("error", err))
@@ -107,13 +120,24 @@ func (cfgmaps *ConfigMaps) List(filter func(release.Releaser) bool) ([]release.R
 	// iterate over the configmaps object list
 	// and decode each release
 	for _, item := range list.Items {
-		rls, err := decodeRelease(item.Data["release"])
-		if err != nil {
-			cfgmaps.Logger().Debug("failed to decode release", slog.Any("item", item), slog.Any("error", err))
-			continue
+		var rls release.Releaser
+		if item.Labels["releaseType"] == "v2" {
+			r, err := decodeReleaseV2(item.Data["release"])
+			if err != nil {
+				cfgmaps.Logger().Debug("failed to decode v2 release", slog.Any("item", item), slog.Any("error", err))
+				continue
+			}
+			r.Labels = item.Labels
+			rls = r
+		} else {
+			r, err := decodeRelease(item.Data["release"])
+			if err != nil {
+				cfgmaps.Logger().Debug("failed to decode release", slog.Any("item", item), slog.Any("error", err))
+				continue
+			}
+			r.Labels = item.Labels
+			rls = r
 		}
-
-		rls.Labels = item.Labels
 
 		if filter(rls) {
 			results = append(results, rls)
@@ -147,12 +171,24 @@ func (cfgmaps *ConfigMaps) Query(labels map[string]string) ([]release.Releaser, 
 
 	var results []release.Releaser
 	for _, item := range list.Items {
-		rls, err := decodeRelease(item.Data["release"])
-		if err != nil {
-			cfgmaps.Logger().Debug("failed to decode release", slog.Any("error", err))
-			continue
+		var rls release.Releaser
+		if item.Labels["releaseType"] == "v2" {
+			r, err := decodeReleaseV2(item.Data["release"])
+			if err != nil {
+				cfgmaps.Logger().Debug("failed to decode v2 release", slog.Any("error", err))
+				continue
+			}
+			r.Labels = item.Labels
+			rls = r
+		} else {
+			r, err := decodeRelease(item.Data["release"])
+			if err != nil {
+				cfgmaps.Logger().Debug("failed to decode release", slog.Any("error", err))
+				continue
+			}
+			r.Labels = item.Labels
+			rls = r
 		}
-		rls.Labels = item.Labels
 		results = append(results, rls)
 	}
 	return results, nil
@@ -173,17 +209,30 @@ func (cfgmaps *ConfigMaps) Create(key string, rls release.Releaser) error {
 	lbs.fromMap(rac.Labels())
 	lbs.set("createdAt", fmt.Sprintf("%v", time.Now().Unix()))
 
-	rel, err := releaserToV1Release(rls)
-	if err != nil {
-		return err
+	// create a new configmap to hold the release
+	var obj *v1.ConfigMap
+	if isV2Release(rls) {
+		rel, err := releaserToV2Release(rls)
+		if err != nil {
+			return err
+		}
+		obj, err = newConfigMapsObjectV2(key, rel, lbs)
+		if err != nil {
+			cfgmaps.Logger().Debug("failed to encode v2 release", slog.String("name", rac.Name()), slog.Any("error", err))
+			return err
+		}
+	} else {
+		rel, err := releaserToV1Release(rls)
+		if err != nil {
+			return err
+		}
+		obj, err = newConfigMapsObject(key, rel, lbs)
+		if err != nil {
+			cfgmaps.Logger().Debug("failed to encode release", slog.String("name", rac.Name()), slog.Any("error", err))
+			return err
+		}
 	}
 
-	// create a new configmap to hold the release
-	obj, err := newConfigMapsObject(key, rel, lbs)
-	if err != nil {
-		cfgmaps.Logger().Debug("failed to encode release", slog.String("name", rac.Name()), slog.Any("error", err))
-		return err
-	}
 	// push the configmap object out into the kubiverse
 	if _, err := cfgmaps.impl.Create(context.Background(), obj, metav1.CreateOptions{}); err != nil {
 		if apierrors.IsAlreadyExists(err) {
@@ -202,25 +251,47 @@ func (cfgmaps *ConfigMaps) Update(key string, rel release.Releaser) error {
 	// set labels for configmaps object meta data
 	var lbs labels
 
-	rls, err := releaserToV1Release(rel)
+	rac, err := release.NewAccessor(rel)
 	if err != nil {
 		return err
 	}
 
 	lbs.init()
-	lbs.fromMap(rls.Labels)
+	lbs.fromMap(rac.Labels())
 	lbs.set("modifiedAt", fmt.Sprintf("%v", time.Now().Unix()))
 
 	// create a new configmap object to hold the release
-	obj, err := newConfigMapsObject(key, rls, lbs)
-	if err != nil {
-		cfgmaps.Logger().Debug(
-			"failed to encode release",
-			slog.String("name", rls.Name),
-			slog.Any("error", err),
-		)
-		return err
+	var obj *v1.ConfigMap
+	if isV2Release(rel) {
+		rls, err := releaserToV2Release(rel)
+		if err != nil {
+			return err
+		}
+		obj, err = newConfigMapsObjectV2(key, rls, lbs)
+		if err != nil {
+			cfgmaps.Logger().Debug(
+				"failed to encode v2 release",
+				slog.String("name", rls.Name),
+				slog.Any("error", err),
+			)
+			return err
+		}
+	} else {
+		rls, err := releaserToV1Release(rel)
+		if err != nil {
+			return err
+		}
+		obj, err = newConfigMapsObject(key, rls, lbs)
+		if err != nil {
+			cfgmaps.Logger().Debug(
+				"failed to encode release",
+				slog.String("name", rls.Name),
+				slog.Any("error", err),
+			)
+			return err
+		}
 	}
+
 	// push the configmap object out into the kubiverse
 	_, err = cfgmaps.impl.Update(context.Background(), obj, metav1.UpdateOptions{})
 	if err != nil {
@@ -276,6 +347,41 @@ func newConfigMapsObject(key string, rls *rspb.Release, lbs labels) (*v1.ConfigM
 	lbs.set("owner", owner)
 	lbs.set("status", rls.Info.Status.String())
 	lbs.set("version", strconv.Itoa(rls.Version))
+
+	// create and return configmap object
+	return &v1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   key,
+			Labels: lbs.toMap(),
+		},
+		Data: map[string]string{"release": s},
+	}, nil
+}
+
+// newConfigMapsObjectV2 constructs a kubernetes ConfigMap object
+// to store a v2 release (for v3 charts).
+func newConfigMapsObjectV2(key string, rls *v2rspb.Release, lbs labels) (*v1.ConfigMap, error) {
+	const owner = "helm"
+
+	// encode the release
+	s, err := encodeReleaseV2(rls)
+	if err != nil {
+		return nil, err
+	}
+
+	if lbs == nil {
+		lbs.init()
+	}
+
+	// apply custom labels
+	lbs.fromMap(rls.Labels)
+
+	// apply labels
+	lbs.set("name", rls.Name)
+	lbs.set("owner", owner)
+	lbs.set("status", rls.Info.Status.String())
+	lbs.set("version", strconv.Itoa(rls.Version))
+	lbs.set("releaseType", "v2") // Mark as v2 release for decoding
 
 	// create and return configmap object
 	return &v1.ConfigMap{
