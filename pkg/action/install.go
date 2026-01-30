@@ -526,6 +526,7 @@ func (i *Install) performInstall(rel *release.Release, toBeAdopted kube.Resource
 		}
 	}
 
+	// TODO: use common.StatusInstalled when we support v2 releases
 	if len(i.Description) > 0 {
 		rel.SetStatus(rcommon.StatusDeployed, i.Description)
 	} else {

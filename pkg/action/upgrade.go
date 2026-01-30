@@ -504,6 +504,7 @@ func (u *Upgrade) releasingUpgrade(c chan<- resultMessage, upgradedRelease *rele
 	originalRelease.Info.Status = rcommon.StatusSuperseded
 	u.cfg.recordRelease(originalRelease)
 
+	// TODO: use common.StatusUpgraded when we support v2 releases
 	upgradedRelease.Info.Status = rcommon.StatusDeployed
 	if len(u.Description) > 0 {
 		upgradedRelease.Info.Description = u.Description
