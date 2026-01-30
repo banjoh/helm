@@ -293,6 +293,7 @@ func (r *Rollback) performRollback(currentRelease, targetRelease *release.Releas
 		r.cfg.recordRelease(rel)
 	}
 
+	// TODO: use common.StatusRolledBack when we support v2 releases
 	targetRelease.Info.Status = common.StatusDeployed
 
 	return targetRelease, nil

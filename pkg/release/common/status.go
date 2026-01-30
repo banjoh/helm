@@ -25,6 +25,15 @@ const (
 	StatusUnknown Status = "unknown"
 	// StatusDeployed indicates that the release has been pushed to Kubernetes.
 	StatusDeployed Status = "deployed"
+	// StatusInstalled indicates that the release has been installed in Kubernetes.
+	// Available only in the Release API v2.
+	StatusInstalled Status = "installed"
+	// StatusUpgraded indicates that the release has been upgraded in Kubernetes.
+	// Available only in the Release API v2.
+	StatusUpgraded Status = "upgraded"
+	// StatusRolledBack indicates that the release has been rolled back in Kubernetes.
+	// Available only in the Release API v2.
+	StatusRolledBack Status = "rolledback"
 	// StatusUninstalled indicates that a release has been uninstalled from Kubernetes.
 	StatusUninstalled Status = "uninstalled"
 	// StatusSuperseded indicates that this release object is outdated and a newer one exists.
