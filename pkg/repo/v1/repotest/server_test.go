@@ -16,6 +16,8 @@ limitations under the License.
 package repotest
 
 import (
+	_ "helm.sh/helm/v4/internal/test/stub"
+
 	"io"
 	"net/http"
 	"path/filepath"

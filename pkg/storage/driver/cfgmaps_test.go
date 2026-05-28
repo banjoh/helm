@@ -14,6 +14,8 @@ limitations under the License.
 package driver
 
 import (
+	_ "helm.sh/helm/v4/internal/test/stub"
+
 	"encoding/base64"
 	"encoding/json"
 	"errors"

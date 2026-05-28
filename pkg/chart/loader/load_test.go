@@ -17,6 +17,8 @@ limitations under the License.
 package loader
 
 import (
+	_ "helm.sh/helm/v4/internal/test/stub"
+
 	"archive/tar"
 	"bytes"
 	"compress/gzip"

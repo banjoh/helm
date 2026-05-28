@@ -18,6 +18,8 @@ limitations under the License.
 package pusher
 
 import (
+	_ "helm.sh/helm/v4/internal/test/stub"
+
 	"io"
 	"os"
 	"path/filepath"

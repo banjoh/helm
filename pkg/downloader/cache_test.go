@@ -17,6 +17,8 @@ limitations under the License.
 package downloader
 
 import (
+	_ "helm.sh/helm/v4/internal/test/stub"
+
 	"bytes"
 	"crypto/sha256"
 	"os"

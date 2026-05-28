@@ -22,7 +22,6 @@ import (
 	"log/slog"
 	"runtime"
 	"strings"
-	"testing"
 
 	"github.com/Masterminds/semver/v3"
 )
@@ -42,10 +41,10 @@ var (
 	gitCommit = ""
 	// gitTreeState is the state of the git tree
 	gitTreeState = ""
-)
-
-const (
-	kubeClientGoVersionTesting = "v1.20"
+	// kubeClientGoVersionTesting is the version of client-go to use during tests.
+	// This is necessary to ensure consistent test output, since test builds don't include debug info / module info.
+	KubeVersionMajorTesting uint64 // 1
+	KubeVersionMinorTesting uint64 // 20
 )
 
 // BuildInfo describes the compile time information.
@@ -82,8 +81,8 @@ func Get() BuildInfo {
 		// Test builds don't include debug info / module info
 		// (And even if they did, we probably want a stable version during tests anyway)
 		// Return a default value for test builds
-		if testing.Testing() {
-			return kubeClientGoVersionTesting
+		if KubeVersionMajorTesting != 0 && KubeVersionMinorTesting != 0 {
+			return fmt.Sprintf("v%d.%d", KubeVersionMajorTesting, KubeVersionMinorTesting)
 		}
 
 		vstr, err := K8sIOClientGoModVersion()

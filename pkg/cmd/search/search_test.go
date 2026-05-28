@@ -17,6 +17,8 @@ limitations under the License.
 package search
 
 import (
+	_ "helm.sh/helm/v4/internal/test/stub"
+
 	"strings"
 	"testing"
 

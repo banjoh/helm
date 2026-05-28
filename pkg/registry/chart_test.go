@@ -17,6 +17,8 @@ limitations under the License.
 package registry // import "helm.sh/helm/v4/pkg/registry"
 
 import (
+	_ "helm.sh/helm/v4/internal/test/stub"
+
 	"reflect"
 	"testing"
 	"time"

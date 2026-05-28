@@ -17,6 +17,8 @@ limitations under the License.
 package storage // import "helm.sh/helm/v4/pkg/storage"
 
 import (
+	_ "helm.sh/helm/v4/internal/test/stub"
+
 	"context"
 	"errors"
 	"fmt"

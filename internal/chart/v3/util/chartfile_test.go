@@ -17,6 +17,8 @@ limitations under the License.
 package util
 
 import (
+	_ "helm.sh/helm/v4/internal/test/stub"
+
 	"testing"
 
 	chart "helm.sh/helm/v4/internal/chart/v3"

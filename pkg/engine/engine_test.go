@@ -17,6 +17,8 @@ limitations under the License.
 package engine
 
 import (
+	_ "helm.sh/helm/v4/internal/test/stub"
+
 	"errors"
 	"fmt"
 	"path"

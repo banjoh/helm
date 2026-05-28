@@ -17,6 +17,8 @@ limitations under the License.
 package rules
 
 import (
+	_ "helm.sh/helm/v4/internal/test/stub"
+
 	"errors"
 	"os"
 	"path/filepath"

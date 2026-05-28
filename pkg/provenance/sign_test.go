@@ -16,6 +16,8 @@ limitations under the License.
 package provenance
 
 import (
+	_ "helm.sh/helm/v4/internal/test/stub"
+
 	"crypto"
 	"errors"
 	"io"

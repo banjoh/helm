@@ -17,6 +17,8 @@ limitations under the License.
 package lint
 
 import (
+	_ "helm.sh/helm/v4/internal/test/stub"
+
 	"strings"
 	"testing"
 	"time"

@@ -21,6 +21,8 @@ import (
 	"testing"
 	"time"
 
+	_ "helm.sh/helm/v4/internal/test/stub"
+
 	"helm.sh/helm/v4/pkg/release/common"
 
 	"github.com/stretchr/testify/assert"

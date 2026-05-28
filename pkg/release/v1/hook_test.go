@@ -17,6 +17,8 @@ limitations under the License.
 package v1
 
 import (
+	_ "helm.sh/helm/v4/internal/test/stub"
+
 	"encoding/json"
 	"testing"
 	"time"

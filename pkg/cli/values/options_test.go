@@ -17,6 +17,8 @@ limitations under the License.
 package values
 
 import (
+	_ "helm.sh/helm/v4/internal/test/stub"
+
 	"bytes"
 	"errors"
 	"os"

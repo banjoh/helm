@@ -14,20 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package monocular
+package stub
 
 import (
-	_ "helm.sh/helm/v4/internal/test/stub"
-
-	"testing"
+	"helm.sh/helm/v4/internal/version"
 )
 
-func TestNew(t *testing.T) {
-	c, err := New("https://hub.helm.sh")
-	if err != nil {
-		t.Errorf("error creating client: %s", err)
-	}
-	if c.BaseURL != "https://hub.helm.sh" {
-		t.Errorf("incorrect BaseURL. Expected \"https://hub.helm.sh\" but got %q", c.BaseURL)
-	}
+func init() {
+	version.KubeVersionMajorTesting = 1
+	version.KubeVersionMinorTesting = 20
 }

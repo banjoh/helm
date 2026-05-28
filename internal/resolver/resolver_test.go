@@ -16,6 +16,8 @@ limitations under the License.
 package resolver
 
 import (
+	_ "helm.sh/helm/v4/internal/test/stub"
+
 	"runtime"
 	"testing"
 

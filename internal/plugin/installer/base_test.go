@@ -14,6 +14,8 @@ limitations under the License.
 package installer // import "helm.sh/helm/v4/internal/plugin/installer"
 
 import (
+	_ "helm.sh/helm/v4/internal/test/stub"
+
 	"testing"
 )
 

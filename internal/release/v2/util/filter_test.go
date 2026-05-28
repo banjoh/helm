@@ -17,6 +17,8 @@ limitations under the License.
 package util // import "helm.sh/helm/v4/internal/release/v2/util"
 
 import (
+	_ "helm.sh/helm/v4/internal/test/stub"
+
 	"testing"
 
 	rspb "helm.sh/helm/v4/internal/release/v2"
