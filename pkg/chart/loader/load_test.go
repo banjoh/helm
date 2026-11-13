@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -31,6 +32,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	c3 "helm.sh/helm/v4/internal/chart/v3"
+	"helm.sh/helm/v4/internal/gates"
 	"helm.sh/helm/v4/pkg/chart"
 	c2 "helm.sh/helm/v4/pkg/chart/v2"
 )
@@ -72,6 +74,7 @@ description: A test chart
 }
 
 func TestLoadArchive(t *testing.T) {
+	t.Setenv(string(gates.ChartV3), "1")
 	testCases := []struct {
 		name            string
 		chartName       string
@@ -167,4 +170,63 @@ func TestLoadArchive(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLoadChartV3Gate(t *testing.T) {
+	writeChart := func(t *testing.T, apiVersion string) (dir, archive string) {
+		t.Helper()
+		dir = filepath.Join(t.TempDir(), "mychart")
+		require.NoError(t, os.MkdirAll(dir, 0o755))
+		chartYAML := fmt.Sprintf("apiVersion: %s\nname: mychart\nversion: 0.1.0\ndescription: A test chart\n", apiVersion)
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "Chart.yaml"), []byte(chartYAML), 0o644))
+
+		archive = filepath.Join(t.TempDir(), "mychart-0.1.0.tgz")
+		data, err := io.ReadAll(createChartArchive(t, "mychart", apiVersion, nil, true))
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(archive, data, 0o644))
+		return dir, archive
+	}
+
+	loaders := map[string]func(t *testing.T, dir, archive string) (chart.Charter, error){
+		"LoadDir":  func(_ *testing.T, dir, _ string) (chart.Charter, error) { return LoadDir(dir) },
+		"LoadFile": func(_ *testing.T, _, archive string) (chart.Charter, error) { return LoadFile(archive) },
+		"LoadArchive": func(t *testing.T, _, _ string) (chart.Charter, error) {
+			t.Helper()
+			return LoadArchive(createChartArchive(t, "mychart", c3.APIVersionV3, nil, true))
+		},
+	}
+
+	for name, load := range loaders {
+		t.Run(name+" v3 gate disabled", func(t *testing.T) {
+			t.Setenv(string(gates.ChartV3), "")
+			dir, archive := writeChart(t, c3.APIVersionV3)
+
+			_, err := load(t, dir, archive)
+			require.Error(t, err)
+			assert.ErrorContains(t, err, string(gates.ChartV3))
+		})
+
+		t.Run(name+" v3 gate enabled", func(t *testing.T) {
+			t.Setenv(string(gates.ChartV3), "1")
+			dir, archive := writeChart(t, c3.APIVersionV3)
+
+			c, err := load(t, dir, archive)
+			require.NoError(t, err)
+			assert.IsType(t, &c3.Chart{}, c)
+		})
+	}
+
+	t.Run("v2 charts load without the gate", func(t *testing.T) {
+		t.Setenv(string(gates.ChartV3), "")
+		dir, archive := writeChart(t, c2.APIVersionV2)
+
+		for name, load := range loaders {
+			if name == "LoadArchive" {
+				continue
+			}
+			c, err := load(t, dir, archive)
+			require.NoErrorf(t, err, "%s", name)
+			assert.IsType(t, &c2.Chart{}, c)
+		}
+	})
 }
